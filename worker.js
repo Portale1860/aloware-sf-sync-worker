@@ -121,7 +121,7 @@ export default {
       }
     }
     
-    // Load SF users for Agent matching
+    // Load SF Agents (custom Agent__c object) for matching
     if (request.method === "POST" && url.pathname === "/load-agents") {
       try {
         if (!SF_INSTANCE || !SF_TOKEN) {
@@ -129,7 +129,7 @@ export default {
         }
         
         const resp = await fetch(
-          `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id, Name FROM Agent__c"),
+          `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id, Name, Aloware_User_Name__c FROM Agent__c"),
           {headers: {"Authorization": `Bearer ${SF_TOKEN}`}}
         );
         
@@ -139,9 +139,18 @@ export default {
         }
         
         const data = await resp.json();
-        const agentMap = {};
-        for (const u of data.records || []) {
-          agentMap[u.Name.toLowerCase()] = u.Id;
+        const agentMap = {};  // Maps Aloware username -> {id, name}
+        for (const a of data.records || []) {
+          // Use Aloware_User_Name__c if available, otherwise use Name
+          const alowareKey = (a.Aloware_User_Name__c || a.Name || "").toLowerCase();
+          if (alowareKey) {
+            agentMap[alowareKey] = { id: a.Id, name: a.Name };
+          }
+          // Also map by Name in case User Name column uses display names
+          const nameKey = (a.Name || "").toLowerCase();
+          if (nameKey && !agentMap[nameKey]) {
+            agentMap[nameKey] = { id: a.Id, name: a.Name };
+          }
         }
         return new Response(JSON.stringify({agentMap, count: Object.keys(agentMap).length}), {headers: corsHeaders});
       } catch (e) {
@@ -267,6 +276,7 @@ h1{color:#333}
 <div class="info">
   <p><b>Source:</b> Supabase aloware_import table</p>
   <p><b>Target:</b> Salesforce Events</p>
+  <p><b>Subject format:</b> "Direction Type - Contact Name | Agent Name"</p>
   <p><b>Key fields set:</b> CreatedDate, LastModifiedDate, Agent__c, Original_Activity_Date__c</p>
 </div>
 <div class="warn">
@@ -318,17 +328,22 @@ function parseTimestamp(ts) {
   return d.toISOString().replace("Z", "+0000");
 }
 
-function buildEvent(row, contactId, agentId) {
+function buildEvent(row, contactId, agentInfo) {
   const ts = parseTimestamp(row["Started At"]);
   if (!ts || !contactId) return null;
   
   const type = row["Type"] || "call";
   const direction = row["Direction"] || "";
-  const name = ((row["Contact First Name"] || "") + " " + (row["Contact Last Name"] || "")).trim() || "Unknown";
+  const contactName = ((row["Contact First Name"] || "") + " " + (row["Contact Last Name"] || "")).trim() || "Unknown";
+  const agentName = agentInfo ? agentInfo.name : null;
   
+  // Build subject with agent name visible: "Outbound SMS - John Damaso | Jack Russo"
   let subject = direction.charAt(0).toUpperCase() + direction.slice(1) + " ";
   subject += type === "sms" ? "SMS" : "Call";
-  subject += " - " + name;
+  subject += " - " + contactName;
+  if (agentName) {
+    subject += " | " + agentName;
+  }
   
   const endTs = new Date(new Date(ts).getTime() + 15*60000).toISOString().replace("Z", "+0000");
   const desc = [row["Body"], row["Notes"], row["Recording"], row["Voicemail"]].filter(Boolean).join("\\n");
@@ -341,7 +356,7 @@ function buildEvent(row, contactId, agentId) {
     EndDateTime: endTs,
     Description: desc ? desc.slice(0, 32000) : null,
     Original_Activity_Date__c: ts,
-    Agent__c: agentId,
+    Agent__c: agentInfo ? agentInfo.id : null,
     OwnerId: "005a500001mkMsbAAE",
     CreatedDate: ts,
     LastModifiedDate: ts,
@@ -400,9 +415,9 @@ document.getElementById("countBtn").onclick = async () => {
     }
     
     document.getElementById("counts").innerHTML = 
-      "<p><b>Supabase records:</b> " + (sbData.count || sbData.error || 0).toLocaleString() + "</p>" +
-      "<p><b>SF Aloware events:</b> " + (sfData.count || sfData.error || 0).toLocaleString() + "</p>";
-    log("Supabase: " + (sbData.count || sbData.error) + ", SF: " + (sfData.count || sfData.error));
+      "<p><b>Supabase records:</b> " + (sbData.count !== undefined ? sbData.count.toLocaleString() : sbData.error) + "</p>" +
+      "<p><b>SF Aloware events:</b> " + (sfData.count !== undefined ? sfData.count.toLocaleString() : sfData.error) + "</p>";
+    log("Supabase: " + (sbData.count !== undefined ? sbData.count : sbData.error) + ", SF: " + (sfData.count !== undefined ? sfData.count : sfData.error));
   } catch (e) {
     log("Count check failed: " + e.message, true);
   }
@@ -447,7 +462,7 @@ document.getElementById("loadBtn").onclick = async () => {
     phoneMap = contactData.phoneMap;
     log("Loaded " + contactData.count + " contacts (" + Object.keys(emailMap).length + " emails, " + Object.keys(phoneMap).length + " phones)");
     
-    log("Loading Salesforce agents...");
+    log("Loading Salesforce agents (Agent__c records)...");
     const agentResp = await fetch("/load-agents", {method: "POST"});
     const agentData = await safeJson(agentResp, "/load-agents");
     
@@ -458,7 +473,7 @@ document.getElementById("loadBtn").onclick = async () => {
     }
     
     agentMap = agentData.agentMap;
-    log("Loaded " + agentData.count + " agents");
+    log("Loaded " + agentData.count + " agents: " + Object.keys(agentMap).slice(0,5).join(", ") + "...");
     
     const countResp = await fetch("/count");
     const countData = await safeJson(countResp, "/count");
@@ -511,10 +526,11 @@ document.getElementById("syncBtn").onclick = async () => {
         
         if (!contactId) { skipped++; continue; }
         
-        const agentName = row["User Name"] ? row["User Name"].toLowerCase() : null;
-        const agentId = agentName ? agentMap[agentName] : null;
+        // Look up agent by "User Name" column from Aloware
+        const userName = row["User Name"] ? row["User Name"].toLowerCase() : null;
+        const agentInfo = userName ? agentMap[userName] : null;
         
-        const event = buildEvent(row, contactId, agentId);
+        const event = buildEvent(row, contactId, agentInfo);
         if (event) events.push(event);
         else skipped++;
       }
@@ -550,7 +566,7 @@ document.getElementById("syncBtn").onclick = async () => {
   log("========== COMPLETE ==========");
   log("Processed: " + processed.toLocaleString());
   log("Created: " + created.toLocaleString());
-  log("Skipped (no contact): " + skipped.toLocaleString());
+  log("Skipped (no contact match): " + skipped.toLocaleString());
   log("Errors: " + errors);
   document.getElementById("syncBtn").textContent = "Done!";
 };
