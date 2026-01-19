@@ -129,7 +129,7 @@ export default {
         }
         
         const resp = await fetch(
-          `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id, Name FROM User WHERE IsActive = true"),
+          `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id, Name FROM Agent__c"),
           {headers: {"Authorization": `Bearer ${SF_TOKEN}`}}
         );
         
