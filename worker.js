@@ -1,5 +1,4 @@
-// Environment variables needed:
-// SUPABASE_URL, SUPABASE_KEY, SF_INSTANCE, SF_TOKEN
+// Environment variables: SUPABASE_URL, SUPABASE_KEY, SF_INSTANCE, SF_TOKEN
 
 export default {
   async fetch(request, env) {
@@ -14,6 +13,7 @@ export default {
       return new Response(HTML, {headers: {"Content-Type": "text/html"}});
     }
     
+    // Load SF contacts for matching
     if (request.method === "POST" && url.pathname === "/load-contacts") {
       let contacts = [];
       let queryUrl = `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id, Email, Phone, MobilePhone FROM Contact");
@@ -35,6 +35,21 @@ export default {
       return new Response(JSON.stringify({emailMap, phoneMap, count: contacts.length}), {headers: {"Content-Type": "application/json"}});
     }
     
+    // Load SF users for Agent matching
+    if (request.method === "POST" && url.pathname === "/load-agents") {
+      const resp = await fetch(
+        `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id, Name FROM User WHERE IsActive = true"),
+        {headers: {"Authorization": `Bearer ${SF_TOKEN}`}}
+      );
+      const data = await resp.json();
+      const agentMap = {};
+      for (const u of data.records || []) {
+        agentMap[u.Name.toLowerCase()] = u.Id;
+      }
+      return new Response(JSON.stringify({agentMap, count: Object.keys(agentMap).length}), {headers: {"Content-Type": "application/json"}});
+    }
+    
+    // Get batch from Supabase
     if (request.method === "POST" && url.pathname === "/get-aloware-batch") {
       const {offset, limit} = await request.json();
       const resp = await fetch(
@@ -44,6 +59,7 @@ export default {
       return new Response(JSON.stringify(await resp.json()), {headers: {"Content-Type": "application/json"}});
     }
     
+    // Create events in SF
     if (request.method === "POST" && url.pathname === "/create-events") {
       const {events} = await request.json();
       const resp = await fetch(`${SF_INSTANCE}/services/data/v59.0/composite/sobjects`, {
@@ -57,11 +73,13 @@ export default {
       return new Response(JSON.stringify({success, errors: errors.slice(0,3)}), {headers: {"Content-Type": "application/json"}});
     }
     
+    // Delete ALL Aloware events (those with Agent__c set)
     if (request.method === "POST" && url.pathname === "/delete-existing") {
       let deleted = 0;
       while (true) {
+        // Query events that have Agent__c populated (Aloware events)
         const queryResp = await fetch(
-          `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id FROM Event WHERE Original_Activity_Date__c != null LIMIT 200"),
+          `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT Id FROM Event WHERE Agent__c != null LIMIT 200"),
           {headers: {"Authorization": `Bearer ${SF_TOKEN}`}}
         );
         const data = await queryResp.json();
@@ -75,6 +93,7 @@ export default {
       return new Response(JSON.stringify({deleted}), {headers: {"Content-Type": "application/json"}});
     }
     
+    // Count Supabase records
     if (request.method === "GET" && url.pathname === "/count") {
       const resp = await fetch(
         `${SUPABASE_URL}/rest/v1/aloware_import?select=count`,
@@ -82,6 +101,16 @@ export default {
       );
       const data = await resp.json();
       return new Response(JSON.stringify({count: data[0]?.count || 0}), {headers: {"Content-Type": "application/json"}});
+    }
+    
+    // Count existing SF Aloware events
+    if (request.method === "GET" && url.pathname === "/sf-count") {
+      const resp = await fetch(
+        `${SF_INSTANCE}/services/data/v59.0/query?q=` + encodeURIComponent("SELECT COUNT(Id) c FROM Event WHERE Agent__c != null"),
+        {headers: {"Authorization": `Bearer ${SF_TOKEN}`}}
+      );
+      const data = await resp.json();
+      return new Response(JSON.stringify({count: data.records?.[0]?.c || 0}), {headers: {"Content-Type": "application/json"}});
     }
     
     return new Response("Not found", {status: 404});
@@ -109,15 +138,22 @@ h1{color:#333}
 #status{margin:10px 0;font-size:18px;font-weight:bold}
 #log{background:#1e1e1e;color:#0f0;padding:15px;height:300px;overflow-y:auto;font-family:monospace;font-size:12px;border-radius:5px}
 .info{background:#e3f2fd;padding:15px;border-radius:5px;margin:10px 0}
+.warn{background:#fff3e0;padding:15px;border-radius:5px;margin:10px 0}
 </style></head><body>
 <h1>Aloware to Salesforce Sync</h1>
 <div class="info">
   <p><b>Source:</b> Supabase aloware_import table</p>
-  <p><b>Target:</b> Salesforce Events with correct timestamps</p>
+  <p><b>Target:</b> Salesforce Events</p>
+  <p><b>Key fields set:</b> CreatedDate, LastModifiedDate, Agent__c, Original_Activity_Date__c</p>
 </div>
+<div class="warn">
+  <p><b>Step 1</b> deletes ALL existing Aloware events (where Agent__c is set). This prevents duplicates.</p>
+</div>
+<div id="counts"></div>
 <div>
-  <button id="deleteBtn" class="btn btn-red">1. Delete Existing Events</button>
-  <button id="loadBtn" class="btn btn-blue">2. Load SF Contacts</button>
+  <button id="countBtn" class="btn btn-blue">Check Counts</button>
+  <button id="deleteBtn" class="btn btn-red">1. Delete Existing Aloware Events</button>
+  <button id="loadBtn" class="btn btn-blue">2. Load Contacts & Agents</button>
   <button id="syncBtn" class="btn btn-green" disabled>3. Start Sync</button>
 </div>
 <div id="progress">
@@ -127,7 +163,7 @@ h1{color:#333}
 <div id="log"></div>
 
 <script>
-let emailMap = {}, phoneMap = {};
+let emailMap = {}, phoneMap = {}, agentMap = {};
 let totalRows = 0, processed = 0, created = 0, errors = 0, skipped = 0;
 
 function log(msg) {
@@ -157,7 +193,7 @@ function parseTimestamp(ts) {
   return d.toISOString().replace("Z", "+0000");
 }
 
-function buildEvent(row, contactId) {
+function buildEvent(row, contactId, agentId) {
   const ts = parseTimestamp(row["Started At"]);
   if (!ts || !contactId) return null;
   
@@ -180,19 +216,31 @@ function buildEvent(row, contactId) {
     EndDateTime: endTs,
     Description: desc ? desc.slice(0, 32000) : null,
     Original_Activity_Date__c: ts,
+    Agent__c: agentId,  // CRITICAL: Links to User, identifies as Aloware event
     OwnerId: "005a500001mkMsbAAE",
-    CreatedDate: ts,
-    LastModifiedDate: ts,
+    CreatedDate: ts,           // CRITICAL: Historical date
+    LastModifiedDate: ts,      // CRITICAL: Activity Timeline uses this for grouping
     aloware__Call_Direction__c: row["Direction"] || null,
     aloware__Call_Disposition__c: row["Call Disposition"] ? row["Call Disposition"].slice(0,255) : null,
     aloware__Disposition_Status__c: row["Disposition Status"] || null
   };
 }
 
+document.getElementById("countBtn").onclick = async () => {
+  log("Checking counts...");
+  const [sbResp, sfResp] = await Promise.all([fetch("/count"), fetch("/sf-count")]);
+  const sbData = await sbResp.json();
+  const sfData = await sfResp.json();
+  document.getElementById("counts").innerHTML = 
+    "<p><b>Supabase records:</b> " + sbData.count.toLocaleString() + "</p>" +
+    "<p><b>SF Aloware events:</b> " + sfData.count.toLocaleString() + "</p>";
+  log("Supabase: " + sbData.count + ", SF: " + sfData.count);
+};
+
 document.getElementById("deleteBtn").onclick = async () => {
-  if (!confirm("Delete ALL existing Aloware events from Salesforce?")) return;
+  if (!confirm("Delete ALL existing Aloware events (where Agent__c is set)?")) return;
   document.getElementById("deleteBtn").disabled = true;
-  log("Deleting existing events...");
+  log("Deleting existing Aloware events...");
   status("Deleting...");
   const resp = await fetch("/delete-existing", {method: "POST"});
   const data = await resp.json();
@@ -203,18 +251,26 @@ document.getElementById("deleteBtn").onclick = async () => {
 
 document.getElementById("loadBtn").onclick = async () => {
   document.getElementById("loadBtn").disabled = true;
+  
   log("Loading Salesforce contacts...");
   status("Loading contacts...");
-  const resp = await fetch("/load-contacts", {method: "POST"});
-  const data = await resp.json();
-  emailMap = data.emailMap;
-  phoneMap = data.phoneMap;
-  log("Loaded " + data.count + " contacts");
+  const contactResp = await fetch("/load-contacts", {method: "POST"});
+  const contactData = await contactResp.json();
+  emailMap = contactData.emailMap;
+  phoneMap = contactData.phoneMap;
+  log("Loaded " + contactData.count + " contacts (" + Object.keys(emailMap).length + " emails, " + Object.keys(phoneMap).length + " phones)");
+  
+  log("Loading Salesforce agents...");
+  const agentResp = await fetch("/load-agents", {method: "POST"});
+  const agentData = await agentResp.json();
+  agentMap = agentData.agentMap;
+  log("Loaded " + agentData.count + " agents");
   
   const countResp = await fetch("/count");
   const countData = await countResp.json();
   totalRows = countData.count;
   log("Records to sync: " + totalRows.toLocaleString());
+  
   status("Ready to sync " + totalRows.toLocaleString() + " records");
   document.getElementById("syncBtn").disabled = false;
   document.getElementById("loadBtn").disabled = false;
@@ -238,11 +294,18 @@ document.getElementById("syncBtn").onclick = async () => {
     
     const events = [];
     for (const row of rows) {
+      // Match contact
       const email = row["Email"] ? row["Email"].toLowerCase() : null;
       const phone = normalizePhone(row["Contact Number"]);
       let contactId = (email && emailMap[email]) || (phone && phoneMap[phone]) || null;
+      
       if (!contactId) { skipped++; continue; }
-      const event = buildEvent(row, contactId);
+      
+      // Match agent
+      const agentName = row["User Name"] ? row["User Name"].toLowerCase() : null;
+      const agentId = agentName ? agentMap[agentName] : null;
+      
+      const event = buildEvent(row, contactId, agentId);
       if (event) events.push(event);
       else skipped++;
     }
@@ -269,10 +332,10 @@ document.getElementById("syncBtn").onclick = async () => {
   log("========== COMPLETE ==========");
   log("Processed: " + processed.toLocaleString());
   log("Created: " + created.toLocaleString());
-  log("Skipped: " + skipped.toLocaleString());
+  log("Skipped (no contact): " + skipped.toLocaleString());
   log("Errors: " + errors);
   document.getElementById("syncBtn").textContent = "Done!";
 };
 
-log("Ready. Click buttons 1, 2, 3 in order.");
+log("Ready. Click 'Check Counts' first, then buttons 1, 2, 3.");
 </script></body></html>`;
